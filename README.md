@@ -36,15 +36,25 @@ Two defects let cache memory ignore its cap. Both are merged.
 - **Index-cache reference cycle** when many datasets are opened. Dropping the dataset did not free the cache. Weak references fixed it. [lance#4680](https://github.com/lance-format/lance/pull/4680), merged **2025-09-10**.
 - **Metadata weigher** under-counted the largest file-metadata fields by about **100×**, so a nominal 1 GiB cap never evicted. A short random-read test gained **7,503 MB** before the fix and plateaued near **500 MB** after it. [commit 8ac0741](https://github.com/lance-format/lance/commit/8ac0741302052ca51e0ba01827d89744f2a62fe2), **2026-04-11**, included in [lance#6480](https://github.com/lance-format/lance/pull/6480).
 
-These commits were not mapped to release tags here. A version number alone does not show that either fix is present.
+Both commits are in the Lance tag this deployment was tested against. See [Running version](#running-version).
+
+### glibc keeps freed pages
+
+Rust frees the temporary search and merge buffers. glibc malloc does not hand those pages back to the operating system. Each worker thread can get its own heap arena, and freed blocks stay parked there. Process RSS ratchets up while the live data stays small. `malloc_trim` mostly trims the main arena, so the other arenas stay bloated.
+
+Measured cases:
+
+- [lancedb#1592](https://github.com/lancedb/lancedb/issues/1592) — one search charged about **1.56 GB** of system bytes while only **29 MB** was in use. `malloc_trim` returned about half. jemalloc via `LD_PRELOAD` ended near **250 MB**. Weston Pace described this as malloc holding a heap the process is likely to need again.
+- [lance#7242](https://github.com/lance-format/lance/issues/7242) — a long `merge_insert` loop grows about **5–7 MB** of RSS per flush, toward **42 GB** after about 1400 flushes, while live heap stays near **30 MB**. After 50 iterations, freed-but-not-returned memory was **395 MB** against **29 MB** in use.
+
+A smaller Lance cache does not release this. The cache accounting can already say the cache is small.
 
 ### Open reports where RSS climbs while the cache stays small
 
-Cache settings do not release this. Maintainers have treated a high-water mark as allocator retention: glibc keeps freed pages because a later query is likely to need them again.
+The allocator tickets are still open. They are open in LanceDB **0.41.0** (29 October 2026) and **0.42.0-beta.29** (24 November 2026). Those releases contain both cache fixes above and still set no custom global allocator. The mimalloc pull request is unmerged.
 
 - [lance#6219](https://github.com/lance-format/lance/issues/6219) — open. Concurrent vector search on Azure. RSS about 0.03 GB to 1.04 GB in minutes while the session cache stayed near 100–140 MB inside a 200 MB cap. `malloc_trim` returned about 50–70 MB, then RSS resumed climbing. Not reproduced on AWS.
-- [lance#7242](https://github.com/lance-format/lance/issues/7242) — open. Repeated `merge_insert` on pylance 7.0.0, about 5–7 MB RSS per flush. Live heap stayed near 30 MB. `MALLOC_ARENA_MAX=2` held RSS flat in the reporter’s run. A mimalloc change ([lance#7245](https://github.com/lance-format/lance/pull/7245)) was not merged.
-- [lancedb#1592](https://github.com/lancedb/lancedb/issues/1592) — open since 2024. One search: about 1.56 GB of system bytes versus 29 MB in use. `malloc_trim` recovered about half. jemalloc via `LD_PRELOAD` ended near 250 MB. Weston Pace called this not a Lance leak.
+- [lance#7242](https://github.com/lance-format/lance/issues/7242) and [lancedb#1592](https://github.com/lancedb/lancedb/issues/1592) — numbers are in the section above. The mimalloc change ([lance#7245](https://github.com/lance-format/lance/pull/7245)) is unmerged.
 
 ### Related issues
 
@@ -71,11 +81,13 @@ db = lancedb.connect(uri, session=session)
 
 `0` disables that tier. Confirm `set_index_cache_capacity` and `set_metadata_cache_capacity` on the installed package before shrinking a live session. The performance guide documents them. The docs.rs session source fetched for this research did not include those setter names.
 
-**Path 2. Cache stays small while RSS still climbs.** This matches the open allocator tickets. The setting that held RSS flat in the merge-insert report is glibc, not a Lance API:
+**Path 2. Cache stays small while RSS still climbs.** This matches the open allocator tickets. Set this on the process before it starts:
 
 ```bash
 MALLOC_ARENA_MAX=2
 ```
+
+`MALLOC_ARENA_MAX=2` is a glibc runtime setting, not a Lance code change. It caps glibc at two arenas so freed pages are not spread across one arena per thread. In the merge-insert report it held RSS flat, about **75–83 MB** across 50 iterations, against a climb to **297 MB** with the default. It can be tried on **0.37.1** or any later version. No upgrade is required.
 
 `malloc_trim(0)` returned only part of the heap in the open tickets, and the floor kept rising. jemalloc via `LD_PRELOAD` is what landed near 250 MB on [lancedb#1592](https://github.com/lancedb/lancedb/issues/1592).
 
@@ -92,8 +104,17 @@ Set `LANCE_IO_THREADS` and `LANCE_CPU_THREADS` before Lance is imported. Thread 
 
 `LANCE_READ_CACHE_REPETITION_INDEX=false` stops repetition-index entries in the metadata cache. That cache is on by default.
 
-## What to check on the running binary
+## Running version
 
-Upgrade to a Lance build that contains the **2025-09-10** weak-reference fix and the **2026-04-11** weigher fix. This research did not map those commits to release tags.
+The pod is on **LanceDB 0.37.1**, released **10 August 2026** ([v0.37.1](https://github.com/lancedb/lancedb/releases/tag/v0.37.1)). That tag was built and tested against **Lance / pylance 10.0.0**, released **7 August 2026**.
+
+0.37.1 does **not** predate the two merged fixes. Both commits are ancestors of Lance `v10.0.0`:
+
+- Index-cache reference cycle, merged 10 September 2025 ([lance#4680](https://github.com/lance-format/lance/pull/4680)).
+- Metadata weigher, merged 11 April 2026 ([lance#6480](https://github.com/lance-format/lance/pull/6480)).
+
+The Python extra still declares `pylance>=5.0.0b5`, so a separately pinned older wheel can miss those commits. Confirm the running build with `lance.__version__`. The 0.37.1 release itself resolved and tested **10.0.0**.
+
+The allocator behavior is unchanged by moving to **0.41.0** or **0.42.0-beta.29**. Both contain the two cache fixes. Neither ships a custom allocator, and [lance#7245](https://github.com/lance-format/lance/pull/7245) is still open. `MALLOC_ARENA_MAX=2` remains the workaround on this version and on those newer ones.
 
 No maintainer has said a healthy cache requires a process restart. Restart is what cleared the credential-stuck index reader in [lance#7904](https://github.com/lance-format/lance/issues/7904).
